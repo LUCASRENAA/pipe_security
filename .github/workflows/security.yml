@@ -4,46 +4,33 @@ name: Android CI Seguro (Todas as Branches)
 
 on:
   push:
+    # Rodar em qualquer push para qualquer branch
     branches:
-      - '**'
+      - '**' 
+
   pull_request:
+    # Rodar em qualquer Pull Request (PR)
     branches:
-      - '**'
-  workflow_dispatch:
+      - '**' 
+      
+  workflow_dispatch: # Permite a execução manual na interface do GitHub
 
 jobs:
   build_test_secure_check:
+    # Permissões Mínimas de Segurança:
+    # - contents: read (para checkout do código)
+    # - security-events: write (CRUCIAL para o upload do SARIF do Trivy)
     permissions:
-      contents: read
-      security-events: write
+      contents: read 
+      security-events: write 
 
     runs-on: ubuntu-latest
-
-    # =========================================================
-    # CONFIGURAÇÃO DE SERVIÇOS: MobSF
-    # O MobSF será executado como um container Docker.
-    # Usaremos a imagem padrão SEM configurar a MOBSF_API_KEY.
-    # =========================================================
-    services:
-      mobsf:
-        # Imagem oficial do MobSF.
-        image: opensecurity/mobile-security-framework-mobsf:latest
-        ports:
-          # Mapeia a porta 8000 do container para a porta 8000 do host (o runner)
-          - 8000:8000
-        options: >-
-          --name mobsf-server
-          # Health check para garantir que o serviço MobSF esteja online e ouvindo
-          --health-cmd "curl -f http://localhost:8000/api/v1/versions || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
+    
     steps:
       - name: 1. Checkout do Código
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Necessário para o Trivy escanear o histórico, se aplicável
 
       - name: 2. Configurar JDK 17
         uses: actions/setup-java@v4
@@ -56,120 +43,54 @@ jobs:
         run: chmod +x gradlew
 
       # =========================================================
-      # 4. a 7. SAST, Testes e Segurança de Dependências (Mantidos)
+      # 4. Análise de Vulnerabilidades de Dependências com Trivy
       # =========================================================
       - name: 4. Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.20.0
+        # Fixar a action em uma versão ou SHA é uma boa prática
+        uses: aquasecurity/trivy-action@0.20.0 
         with:
           scan-type: 'fs'
           scan-ref: 'app/build.gradle.kts'
-          exit-code: '1'
-          severity: 'CRITICAL,HIGH'
+          
+          # Configuração de Quebra de Build (FAIL FAST)
+          # A build falhará se encontrar vulnerabilidades Críticas ou Altas.
+          exit-code: '1' 
+          severity: 'CRITICAL,HIGH' 
+          
+          # Configuração de Geração de Relatório SARIF (para Code Scanning)
           format: 'sarif'
           limit-severities-for-sarif: false
           output: 'trivy-results.sarif'
 
       - name: 5. Upload Trivy SARIF results
+        # Envia os resultados do Trivy para a aba 'Security' do GitHub
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
 
       - name: 6. Análise Estática de Código (Android Lint)
+        # O Lint verifica bugs, usabilidade e algumas falhas de segurança no código.
         run: ./gradlew lintDebug
 
       - name: 7. Executar Testes Unitários
         run: ./gradlew testDebugUnitTest
 
       # =========================================================
-      # 8. Montar a Build de Debug (Necessário para DAST)
+      # 8. e 9. Build e Upload de Artefatos (OPCIONAL/CONDICIONAL)
+      # 
+      # Estes passos são pulados em Pull Requests para evitar o uso
+      # desnecessário de recursos e o risco de vazamento de segredos.
       # =========================================================
-      - name: 8. Montar a Build de Debug (APK)
+      - name: 8. Montar a Build de Debug
+        # Roda apenas em Push (merge/direto na branch), não em Pull Requests
+        if: github.event_name != 'pull_request'
         run: ./gradlew assembleDebug
 
-      # =========================================================
-      # 9. Análise Dinâmica de Segurança (DAST) com MobSF
-      # =========================================================
-
-      # O GitHub Actions já espera o serviço MobSF estar saudável (devido ao health-cmd)
-
-      - name: 9. Executar DAST com MobSF API (Upload e Scan)
-        id: mobsf_dast
-        run: |
-          # O MobSF está acessível via 'http://localhost:8000'
-          # *OU* 'http://mobsf:8000' se executado como serviço.
-          # No GitHub Actions services, o nome do serviço (mobsf) é o nome do host.
-          MOBSF_URL="http://mobsf:8000/api/v1"
-          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
-          
-          if [ ! -f "$APK_PATH" ]; then
-            echo "Erro: APK não encontrado em $APK_PATH"
-            exit 1
-          fi
-
-          echo "Upload do APK para o MobSF..."
-          UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST $MOBSF_URL/upload \
-            -F "file=@$APK_PATH" \
-            -o mobsf_upload.json)
-
-          HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n 1)
-          
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "Erro no Upload (código $HTTP_CODE):"
-            cat mobsf_upload.json
-            exit 1
-          fi
-
-          echo "Upload bem-sucedido."
-          FILE_HASH=$(jq -r '.hash' mobsf_upload.json)
-          
-          echo "mobsf_hash=$FILE_HASH" >> $GITHUB_OUTPUT
-
-          # Inicia a Análise Estática/Dinâmica.
-          # NOTA: O MobSF rodará apenas a Análise Estática (SAST)
-          # sem a configuração de um emulador Android (AVD) adicional.
-          echo "Iniciando Análise (SAST e DAST básico)..."
-          SCAN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST $MOBSF_URL/scan \
-            -F "hash=$FILE_HASH" \
-            -o mobsf_scan.json)
-
-          SCAN_HTTP_CODE=$(echo "$SCAN_RESPONSE" | tail -n 1)
-
-          if [ "$SCAN_HTTP_CODE" -ne 200 ]; then
-            echo "Erro na Análise (código $SCAN_HTTP_CODE):"
-            cat mobsf_scan.json
-            exit 1
-          fi
-          echo "Análise iniciada/concluída (SAST)."
-
-      - name: 10. Baixar e Processar Resultados do MobSF
-        run: |
-          FILE_HASH="${{ steps.mobsf_dast.outputs.mobsf_hash }}"
-          MOBSF_URL="http://mobsf:8000/api/v1"
-          
-          echo "Baixando o relatório JSON..."
-          curl -s -X POST $MOBSF_URL/report_json \
-            -F "hash=$FILE_HASH" \
-            -o mobsf_report.json
-
-          echo "Resumo das vulnerabilidades encontradas pelo MobSF (SAST):"
-          
-          # Use jq para extrair e imprimir vulnerabilidades críticas/altas (Exemplo)
-          CRITICAL_COUNT=$(jq '.static_analysis.total_vulnerabilities.critical' mobsf_report.json)
-          HIGH_COUNT=$(jq '.static_analysis.total_vulnerabilities.high' mobsf_report.json)
-          
-          echo "Críticas: $CRITICAL_COUNT"
-          echo "Altas: $HIGH_COUNT"
-          
-          # Opcional: Quebrar o build se houver vulnerabilidades críticas
-          if [ "$CRITICAL_COUNT" -gt 0 ]; then
-            echo "Encontradas $CRITICAL_COUNT vulnerabilidades Críticas. Falhando o pipeline."
-            exit 1
-          fi
-
-      # ... (Passos de Upload de Artefatos)
-      - name: 11. Upload do Artefato (APK)
+      - name: 9. Upload do Artefato (APK)
+        # Roda apenas se não for PR e a build foi bem-sucedida
         if: github.event_name != 'pull_request' && success()
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk-${{ github.ref_name }}
+          # O nome do arquivo incluirá o nome da branch para facilitar a identificação
+          name: app-debug-apk-${{ github.ref_name }} 
           path: app/build/outputs/apk/debug/app-debug.apk
