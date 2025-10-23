@@ -1,0 +1,176 @@
+# .github/workflows/android_ci_seguro.yml
+
+name: Android CI Seguro (Todas as Branches)
+
+on:
+  push:
+    branches:
+      - '**'
+
+  pull_request:
+    branches:
+      - '**'
+
+  workflow_dispatch:
+
+jobs:
+  build_test_secure_check:
+    permissions:
+      contents: read
+      security-events: write
+
+    runs-on: ubuntu-latest
+
+    # =========================================================
+    # CONFIGURAÇÃO DE SERVIÇOS/DEPENDÊNCIAS
+    # O MobSF será executado como um serviço em um container Docker
+    # O container MobSF escuta na porta 8000
+    # =========================================================
+    services:
+      mobsf:
+        # Imagem oficial do MobSF. Fixar a versão é recomendado.
+        image: opensecurity/mobile-security-framework-mobsf:latest
+        ports:
+          - 8000:8000
+        options: >-
+          --name mobsf-server
+          -e MOBSF_API_KEY=${{ secrets.MOBSF_API_KEY }}
+          --health-cmd "curl -f http://localhost:8000/api/v1/versions || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: 1. Checkout do Código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 2. Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: 3. Permissões de Execução para Gradle Wrapper
+        run: chmod +x gradlew
+
+      # ... (Passos 4 e 5: Trivy) ...
+      - name: 4. Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: 'fs'
+          scan-ref: 'app/build.gradle.kts'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          limit-severities-for-sarif: false
+          output: 'trivy-results.sarif'
+
+      - name: 5. Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: 6. Análise Estática de Código (Android Lint)
+        run: ./gradlew lintDebug
+
+      - name: 7. Executar Testes Unitários
+        run: ./gradlew testDebugUnitTest
+
+      # =========================================================
+      # 8. Montar a Build de Debug (Necessário para DAST)
+      # Agora executamos em todas as condições para o MobSF.
+      # =========================================================
+      - name: 8. Montar a Build de Debug (APK)
+        run: ./gradlew assembleDebug
+
+      # =========================================================
+      # 9. Análise Dinâmica de Segurança (DAST) com MobSF
+      # =========================================================
+
+      # A MobSF API espera que o serviço esteja online.
+      - name: 9. Esperar o MobSF Server estar pronto
+        run: docker logs mobsf-server
+        # O GitHub Actions já espera pelo --health-cmd definido no 'services'
+
+      - name: 10. Executar DAST com MobSF API (Upload e Scan)
+        id: mobsf_dast
+        run: |
+          # 1. Variáveis de Configuração
+          MOBSF_URL="http://localhost:8000/api/v1"
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          # Sua chave de API do MobSF deve ser um Secret do GitHub.
+          API_KEY="${{ secrets.MOBSF_API_KEY }}" 
+          
+          # Certifique-se de que o arquivo existe
+          if [ ! -f "$APK_PATH" ]; then
+            echo "Erro: APK não encontrado em $APK_PATH"
+            exit 1
+          fi
+
+          echo "Upload do APK para o MobSF..."
+          UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST $MOBSF_URL/upload \
+            -H "Authorization: $API_KEY" \
+            -F "file=@$APK_PATH" \
+            -o mobsf_upload.json)
+
+          HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n 1)
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Erro no Upload (código $HTTP_CODE):"
+            cat mobsf_upload.json
+            exit 1
+          fi
+
+          echo "Upload bem-sucedido."
+          FILE_HASH=$(jq -r '.hash' mobsf_upload.json)
+          
+          # Armazena o hash para o próximo passo
+          echo "mobsf_hash=$FILE_HASH" >> $GITHUB_OUTPUT
+
+          # Inicia a Análise Dinâmica
+          echo "Iniciando Análise Dinâmica (DAST)..."
+          # Nota: O MobSF DAST requer um ambiente de emulador configurado. 
+          # Sem o emulador, este passo pode falhar ou apenas fazer a análise estática novamente.
+          # Neste exemplo, estamos APENAS usando a API de 'scan', que faz SAST/DAST se configurado.
+          SCAN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST $MOBSF_URL/scan \
+            -H "Authorization: $API_KEY" \
+            -F "hash=$FILE_HASH" \
+            -o mobsf_scan.json)
+
+          SCAN_HTTP_CODE=$(echo "$SCAN_RESPONSE" | tail -n 1)
+
+          if [ "$SCAN_HTTP_CODE" -ne 200 ]; then
+            echo "Erro na Análise (código $SCAN_HTTP_CODE):"
+            cat mobsf_scan.json
+            exit 1
+          fi
+          echo "Análise iniciada (SAST e DAST, se o ambiente dinâmico estiver configurado)."
+
+      - name: 11. Baixar e Processar Resultados do MobSF (Exemplo)
+        # Nota: O MobSF não gera SARIF nativamente. Seria necessário um conversor.
+        # Aqui, estamos apenas baixando o JSON e imprimindo o resumo.
+        run: |
+          FILE_HASH="${{ steps.mobsf_dast.outputs.mobsf_hash }}"
+          MOBSF_URL="http://localhost:8000/api/v1"
+          API_KEY="${{ secrets.MOBSF_API_KEY }}"
+          
+          echo "Baixando o relatório JSON..."
+          curl -s -X POST $MOBSF_URL/report_json \
+            -H "Authorization: $API_KEY" \
+            -F "hash=$FILE_HASH" \
+            -o mobsf_report.json
+
+          echo "Resumo das vulnerabilidades (SAST/DAST):"
+          jq -r '.static_analysis.total_vulnerabilities, .dynamic_analysis.total_vulnerabilities' mobsf_report.json
+
+
+      # ... (Passos 12 e 13: Upload de Artefatos, renomeados)
+      - name: 12. Upload do Artefato (APK)
+        if: github.event_name != 'pull_request' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk-${{ github.ref_name }}
+          path: app/build/outputs/apk/debug/app-debug.apk
